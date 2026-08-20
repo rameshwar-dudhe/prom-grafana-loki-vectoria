@@ -1,0 +1,65 @@
+
+  monitoring-stack {{ .Chart.Version }} deployed to namespace {{ .Release.Namespace }}
+
+  ┌─ OPEN GRAFANA ──────────────────────────────────────────────────────────┐
+{{- if and .Values.grafana.enabled (eq (.Values.grafana.service.type | toString) "NodePort") }}
+
+    http://192.168.56.134:{{ .Values.grafana.service.nodePort }}
+    http://192.168.56.135:{{ .Values.grafana.service.nodePort }}   (either node works)
+
+    user:     {{ .Values.grafana.adminUser }}
+    password: {{ .Values.grafana.adminPassword }}
+{{- if eq (.Values.grafana.adminPassword | toString) "admin" }}
+
+    ^ this is the lab default. Change grafana.adminPassword before using this
+      anywhere that matters.
+{{- end }}
+{{- else if .Values.grafana.enabled }}
+
+    kubectl port-forward -n {{ .Release.Namespace }} svc/{{ .Release.Name }}-grafana 3000:80
+    then open http://localhost:3000
+{{- end }}
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Four dashboards are provisioned automatically (no import needed):
+
+    Cluster Health     nodes ready, pods by phase, capacity, firing alerts
+    Nodes              per-node CPU / memory / disk / network
+    Pods & Workloads   per-pod CPU / memory / restarts, top consumers
+    Logs               live pod logs from Loki, filterable by namespace and pod
+
+  It takes 2-3 minutes after install before panels fill in — Prometheus has to
+  scrape, then remote_write into VictoriaMetrics.
+
+  ┌─ CHECK IT IS WORKING ───────────────────────────────────────────────────┐
+
+    kubectl get pods -n {{ .Release.Namespace }}
+    kubectl get pvc  -n {{ .Release.Namespace }}
+
+    # both DaemonSets should read 2/2 — that is what proves the tainted
+    # control-plane node is being monitored too
+    kubectl get ds -n {{ .Release.Namespace }}
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ REMOVE EVERYTHING ─────────────────────────────────────────────────────┐
+
+    helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+    kubectl delete ns {{ .Release.Namespace }}
+
+    Both commands are needed: Helm does not delete the PVC that
+    VictoriaMetrics' StatefulSet created, so the namespace delete is what
+    reclaims the disk. `make uninstall` runs both for you.
+  └─────────────────────────────────────────────────────────────────────────┘
+{{- if not .Values.victoriametrics.enabled }}
+
+  ! victoriametrics.enabled=false — Grafana's default datasource will not
+    resolve and metric panels will be empty.
+{{- end }}
+{{- if not .Values.loki.enabled }}
+
+  ! loki.enabled=false — the Logs dashboard will not return anything.
+{{- end }}
+{{- if not .Values.alloy.enabled }}
+
+  ! alloy.enabled=false — nothing is shipping logs into Loki.
+{{- end }}

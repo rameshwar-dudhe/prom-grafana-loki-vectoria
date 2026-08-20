@@ -1,0 +1,57 @@
+apiVersion: v2
+name: monitoring-stack
+description: |
+  Self-contained observability stack for the k8s-ha cluster: Prometheus scrapes,
+  VictoriaMetrics stores long-term, Alloy ships pod logs to Loki, and Grafana
+  presents everything through pre-provisioned datasources and dashboards.
+  Deliberately CRD-free so that `helm uninstall` leaves nothing behind.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - monitoring
+  - observability
+  - prometheus
+  - victoriametrics
+  - loki
+  - grafana
+home: https://github.com/consectus/prom-grafana-loki-vectoria
+maintainers:
+  - name: Platform
+    email: vikrant.satpute@consectus.com
+
+# NOTE: every dependency below is CRD-free on purpose.
+# kube-prometheus-stack and victoria-metrics-operator would be the more common
+# picks, but Helm never deletes CRDs on uninstall, which would break the
+# "remove cleanly in one command" requirement.
+dependencies:
+  # Scraper + kube-state-metrics + node-exporter + Alertmanager (all subcharts).
+  - name: prometheus
+    version: "29.24.0"
+    repository: https://prometheus-community.github.io/helm-charts
+    condition: prometheus.enabled
+
+  # Long-term metric store; Grafana's default datasource.
+  - name: victoria-metrics-single
+    version: "0.44.0"
+    repository: https://victoriametrics.github.io/helm-charts
+    alias: victoriametrics
+    condition: victoriametrics.enabled
+
+  # Log store, single-binary + filesystem mode.
+  - name: loki
+    version: "7.3.0"
+    repository: https://grafana.github.io/helm-charts
+    condition: loki.enabled
+
+  # Log collector DaemonSet (successor to the now-EOL Promtail).
+  - name: alloy
+    version: "1.11.1"
+    repository: https://grafana.github.io/helm-charts
+    condition: alloy.enabled
+
+  # UI.
+  - name: grafana
+    version: "10.5.15"
+    repository: https://grafana.github.io/helm-charts
+    condition: grafana.enabled

@@ -1,0 +1,26 @@
+{{/*
+One ConfigMap per file in dashboards/, labelled so the Grafana sidecar picks it
+up and provisions it automatically. Dashboards are embedded rather than
+downloaded by gnetId, so provisioning needs no internet access at pod runtime
+and the panels cannot drift from what this chart was tested against.
+*/}}
+{{- include "monitoring-stack.validateReleaseName" . -}}
+{{- if .Values.grafana.enabled }}
+{{- range $path, $bytes := .Files.Glob "dashboards/*.json" }}
+{{- $filename := base $path }}
+{{- $slug := $filename | trimSuffix ".json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $.Release.Name }}-dashboard-{{ $slug }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "monitoring-stack.labels" $ | nindent 4 }}
+    # The sidecar watches for exactly this label (grafana.sidecar.dashboards).
+    grafana_dashboard: "1"
+data:
+  {{ $filename }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}

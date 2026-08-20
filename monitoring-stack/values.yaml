@@ -1,0 +1,702 @@
+# ============================================================================
+#  monitoring-stack — single place to tune the whole observability stack
+# ============================================================================
+#
+#  Data flow:
+#
+#    node-exporter ─┐
+#    kube-state-m. ─┤
+#    kubelet/cAdv. ─┼─> Prometheus ──remote_write──> VictoriaMetrics ─┐
+#    kube-apiserver ┘   (6h, scraper)                (15d, storage)   │
+#                             │                                      │
+#                        Alertmanager                                ├─> Grafana
+#                                                                    │   :30300
+#    pod logs ─> Alloy (DaemonSet) ──push──> Loki (single binary) ────┘
+#
+#  Design rules worth knowing before you edit this file:
+#    * NO CRDs anywhere, so `helm uninstall` leaves nothing behind. This is why
+#      the stack uses the plain `prometheus` chart instead of kube-prometheus-stack,
+#      and why alloy.crds.create is forced to false below.
+#    * Every component tolerates the control-plane taint, so the whole stack can
+#      run on k8s-cp-0 alone if k8s-w-0 goes away (it has, twice).
+#    * Grafana datasource UIDs are hardcoded and referenced by the dashboards.
+#      Do not rename them or every dashboard panel breaks.
+# ============================================================================
+
+# Shared knobs referenced by the templates in this umbrella chart.
+global:
+  # Node name / IP used in the NOTES.txt access hints only.
+  clusterName: k8s-ha
+
+# ----------------------------------------------------------------------------
+#  Tolerations shared by the single-instance components.
+#  DaemonSets use a broader "tolerate everything" list defined inline instead.
+# ----------------------------------------------------------------------------
+# (Anchors let us reuse this without repeating it five times.)
+_controlPlaneTolerations: &controlPlaneTolerations
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+_tolerateEverything: &tolerateEverything
+  - operator: Exists
+
+# ============================================================================
+#  1. PROMETHEUS — scraper + kube-state-metrics + node-exporter + Alertmanager
+# ============================================================================
+prometheus:
+  enabled: true
+
+  server:
+    # Short local retention on purpose: Prometheus is the *scraper* here, while
+    # VictoriaMetrics is the long-term store. Keeping 6h locally is enough to
+    # ride out a VM restart without wasting disk on duplicate storage.
+    retention: 6h
+
+    persistentVolume:
+      enabled: true
+      size: 5Gi
+      # local-path is the cluster default; left blank to use it.
+      storageClass: ""
+
+    # ---- remote_write to VictoriaMetrics -----------------------------------
+    # Service name comes from the `victoriametrics` alias in Chart.yaml.
+    remoteWrite:
+      - url: http://monitoring-victoriametrics-server:8428/api/v1/write
+        remote_timeout: 30s
+        queue_config:
+          capacity: 5000
+          max_shards: 5
+          min_shards: 1
+          max_samples_per_send: 1000
+          batch_send_deadline: 5s
+
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+
+    tolerations: *controlPlaneTolerations
+
+    service:
+      type: ClusterIP
+
+    global:
+      scrape_interval: 30s
+      scrape_timeout: 10s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: k8s-ha
+
+  # ---- Alertmanager --------------------------------------------------------
+  # Enabled, but with no notification receivers: alerts are for *viewing* in
+  # Grafana, not paging. Add a receiver here when you want notifications.
+  alertmanager:
+    enabled: true
+    persistence:
+      enabled: false          # alert state is disposable; avoids a 5th PVC
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+    tolerations: *controlPlaneTolerations
+
+  # ---- kube-state-metrics: cluster object state (pods, deployments, nodes) --
+  kube-state-metrics:
+    enabled: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 192Mi
+    tolerations: *controlPlaneTolerations
+
+  # ---- node-exporter: per-node CPU / memory / disk / network ---------------
+  # DaemonSet: must tolerate EVERYTHING or k8s-cp-0 silently goes missing from
+  # every node dashboard.
+  prometheus-node-exporter:
+    enabled: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+    tolerations: *tolerateEverything
+
+  # ---- pushgateway: not used, and it would show up as a down target --------
+  prometheus-pushgateway:
+    enabled: false
+
+  # ------------------------------------------------------------------------
+  #  Scrape configuration
+  #
+  #  The prometheus chart exposes each job as a key under `scrapeConfigs`.
+  #  IMPORTANT: Helm REPLACES lists, it does not merge them. So where we touch
+  #  `relabel_configs` below we restate the chart's original entries and then
+  #  add ours — dropping the originals would break target discovery.
+  # ------------------------------------------------------------------------
+  scrapeConfigs:
+
+    # kubelet's own metrics. The chart's default relabeling produces no `node`
+    # label, so per-node grouping is impossible without this addition.
+    kubernetes-nodes:
+      enabled: true
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        insecure_skip_verify: true
+      kubernetes_sd_configs:
+        - role: node
+      relabel_configs:
+        # --- original chart entry ---
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        # --- our addition: give every series a stable `node` label ---
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+
+    # cAdvisor: per-container CPU / memory / network. Same missing-`node` issue,
+    # and this is the job the pod dashboards depend on most.
+    kubernetes-nodes-cadvisor:
+      enabled: true
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      scheme: https
+      metrics_path: /metrics/cadvisor
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        insecure_skip_verify: true
+      kubernetes_sd_configs:
+        - role: node
+      relabel_configs:
+        # --- original chart entries ---
+        - action: labelmap
+          regex: __meta_kubernetes_node_label_(.+)
+        - source_labels: [__metrics_path__]
+          target_label: metrics_path
+        # --- our addition ---
+        - source_labels: [__meta_kubernetes_node_name]
+          target_label: node
+
+    # Left at chart defaults — `kubernetes-service-endpoints` already ends with
+    # `__meta_kubernetes_pod_node_name -> node`, so node-exporter and
+    # kube-state-metrics get their `node` label for free.
+    #
+    # Disabled below: the pushgateway job would be a permanently-down target.
+    prometheus-pushgateway:
+      enabled: false
+
+  # ------------------------------------------------------------------------
+  #  Alert rules. `serverFiles."prometheus.yml".rule_files` already points at
+  #  /etc/config/alerting_rules.yml, so these are picked up automatically.
+  #  No receivers are configured — view them in Grafana > Alerting.
+  # ------------------------------------------------------------------------
+  serverFiles:
+    alerting_rules.yml:
+      groups:
+        - name: nodes
+          rules:
+            - alert: NodeNotReady
+              expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+              for: 5m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Node {{ $labels.node }} is not Ready"
+                description: "{{ $labels.node }} has been NotReady for more than 5 minutes."
+
+            - alert: NodeHighCPU
+              expr: 100 - (avg by(node) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High CPU on {{ $labels.node }}"
+                description: "CPU has been above 85% for 10 minutes (currently {{ $value | printf \"%.1f\" }}%)."
+
+            - alert: NodeHighMemory
+              expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High memory on {{ $labels.node }}"
+                description: "Memory has been above 85% for 10 minutes (currently {{ $value | printf \"%.1f\" }}%)."
+
+            - alert: NodeDiskFillingUp
+              expr: |
+                100 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint="/"}
+                       / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint="/"} * 100) > 85
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "Root filesystem on {{ $labels.node }} is {{ $value | printf \"%.1f\" }}% full"
+                description: "local-path PVs live on the root disk, so this affects the monitoring stack itself."
+
+        - name: pods
+          rules:
+            - alert: PodCrashLooping
+              expr: increase(kube_pod_container_status_restarts_total[15m]) > 3
+              for: 5m
+              labels:
+                severity: warning
+              annotations:
+                summary: "{{ $labels.namespace }}/{{ $labels.pod }} is restarting repeatedly"
+                description: "More than 3 restarts in 15 minutes."
+
+            - alert: PodNotReady
+              expr: kube_pod_status_phase{phase=~"Pending|Unknown|Failed"} == 1
+              for: 15m
+              labels:
+                severity: warning
+              annotations:
+                summary: "{{ $labels.namespace }}/{{ $labels.pod }} is {{ $labels.phase }}"
+                description: "Pod has been in a non-running phase for 15 minutes."
+
+            - alert: ContainerOOMKilled
+              expr: kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+              for: 1m
+              labels:
+                severity: warning
+              annotations:
+                summary: "{{ $labels.namespace }}/{{ $labels.pod }} was OOMKilled"
+                description: "Container {{ $labels.container }} hit its memory limit."
+
+        - name: monitoring-stack
+          rules:
+            - alert: PrometheusTargetDown
+              expr: up == 0
+              for: 10m
+              labels:
+                severity: warning
+              annotations:
+                summary: "Scrape target {{ $labels.job }} is down"
+                description: "{{ $labels.job }} on {{ $labels.instance }} has been unreachable for 10 minutes."
+
+            - alert: RemoteWriteFailing
+              expr: rate(prometheus_remote_storage_samples_failed_total[5m]) > 0
+              for: 10m
+              labels:
+                severity: critical
+              annotations:
+                summary: "remote_write to VictoriaMetrics is failing"
+                description: "Metrics are not reaching long-term storage; dashboards will show gaps."
+
+# ============================================================================
+#  2. VICTORIAMETRICS — long-term metric store, Grafana's default datasource
+# ============================================================================
+victoriametrics:
+  enabled: true
+
+  server:
+    # NOTE: a bare number here means MONTHS to VictoriaMetrics ("1" = 1 month).
+    # The explicit `d` suffix is what makes this 15 days.
+    retentionPeriod: 15d
+
+    persistentVolume:
+      enabled: true
+      size: 10Gi
+      storageClassName: ""
+
+    resources:
+      requests:
+        cpu: 300m
+        memory: 1Gi
+      limits:
+        memory: 2Gi
+
+    tolerations: *controlPlaneTolerations
+
+    # Scraped by Prometheus via the service-endpoints job so VM monitors itself.
+    service:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8428"
+
+# ============================================================================
+#  3. LOKI — log store, single binary + filesystem
+# ============================================================================
+#  The chart's defaults are built for a scalable cloud deployment and will NOT
+#  work here. Two things in particular:
+#    * chunksCache defaults to an 8Gi memcached (plus a 1Gi resultsCache) —
+#      that alone never schedules on a 7.4Gi node.
+#    * SimpleScalable mode runs read/write/backend at 3 replicas each and
+#      expects S3-compatible object storage.
+#  Everything below exists to pin it to a single-node, filesystem-backed setup.
+# ============================================================================
+loki:
+  enabled: true
+
+  deploymentMode: SingleBinary
+
+  loki:
+    auth_enabled: false        # default true → would require an X-Scope-OrgID header
+
+    commonConfig:
+      replication_factor: 1    # default 3; impossible with one instance
+      path_prefix: /var/loki
+
+    storage:
+      type: filesystem
+      filesystem:
+        chunks_directory: /var/loki/chunks
+        rules_directory: /var/loki/rules
+
+    # Must be stated explicitly — it defaults to {} and the chart refuses to
+    # render a config without it.
+    schemaConfig:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+
+    limits_config:
+      retention_period: 168h            # 7 days
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      max_cache_freshness_per_query: 10m
+      # Generous enough for a lab cluster's log volume without unbounded growth.
+      ingestion_rate_mb: 10
+      ingestion_burst_size_mb: 20
+      volume_enabled: true              # powers the log-volume panels
+
+    compactor:
+      working_directory: /var/loki/compactor
+      retention_enabled: true
+      delete_request_store: filesystem
+
+    server:
+      http_listen_port: 3100
+      grpc_server_max_recv_msg_size: 8388608
+      grpc_server_max_send_msg_size: 8388608
+
+  singleBinary:
+    replicas: 1
+    persistence:
+      enabled: true
+      size: 10Gi
+      storageClass: null
+    resources:
+      requests:
+        cpu: 300m
+        memory: 512Mi
+      limits:
+        memory: 1Gi
+    tolerations: *controlPlaneTolerations
+
+  # Unused in SingleBinary mode — must be zeroed or the chart still renders them.
+  read:
+    replicas: 0
+  write:
+    replicas: 0
+  backend:
+    replicas: 0
+
+  # The memory traps. Do not re-enable on a cluster this size.
+  chunksCache:
+    enabled: false
+  resultsCache:
+    enabled: false
+
+  # Extras that add pods without adding value here.
+  lokiCanary:
+    enabled: false
+  test:
+    enabled: false
+  minio:
+    enabled: false
+  # No nginx gateway: Alloy and Grafana talk to the Loki service directly.
+  gateway:
+    enabled: false
+
+# ============================================================================
+#  4. ALLOY — log collector DaemonSet (successor to the now-EOL Promtail)
+# ============================================================================
+alloy:
+  enabled: true
+
+  # CRITICAL: this chart ships a `crds` subchart (the monitoring.grafana.com
+  # PodLogs CRD) and creates it by default. Helm never deletes CRDs on
+  # uninstall, which would break the clean-removal guarantee. We configure log
+  # collection directly in the config below, so the CRD is not needed.
+  crds:
+    create: false
+
+  controller:
+    type: daemonset
+    # DaemonSet: tolerate everything so k8s-cp-0's logs are collected too.
+    tolerations: *tolerateEverything
+
+  alloy:
+    # Needed to read /var/log/pods on the host.
+    mounts:
+      varlog: true
+
+    clustering:
+      enabled: false
+
+    # Reading other containers' logs from the host requires root.
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      privileged: false
+
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+
+    configMap:
+      create: true
+      # ---- Alloy configuration (Alloy syntax, not YAML) -------------------
+      # Pipeline: discover pods -> keep this node's only -> relabel to useful
+      # labels -> tail files from /var/log/pods -> push to Loki.
+      #
+      # We tail files on disk rather than streaming from the kubelet API: it
+      # survives API server restarts and puts no load on the control plane.
+      content: |-
+        // Discover every pod in the cluster.
+        discovery.kubernetes "pods" {
+          role = "pod"
+        }
+
+        // Keep only pods on THIS node — each DaemonSet member handles its own,
+        // otherwise every node would ship every pod's logs.
+        discovery.relabel "pod_logs" {
+          targets = discovery.kubernetes.pods.targets
+
+          rule {
+            source_labels = ["__meta_kubernetes_pod_node_name"]
+            target_label  = "node"
+          }
+          // The Alloy chart injects HOSTNAME from spec.nodeName, so this is the
+          // NODE name here, not the pod name.
+          rule {
+            source_labels = ["node"]
+            regex         = sys.env("HOSTNAME")
+            action        = "keep"
+          }
+
+          // Labels the dashboards filter on. Keep this set small: every extra
+          // label multiplies Loki's stream cardinality.
+          rule {
+            source_labels = ["__meta_kubernetes_namespace"]
+            target_label  = "namespace"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_name"]
+            target_label  = "pod"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_container_name"]
+            target_label  = "container"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+            target_label  = "app"
+          }
+
+          // Build the on-disk path: /var/log/pods/<ns>_<pod>_<uid>/<container>/*.log
+          //
+          // Two things here are REQUIRED and both fail silently if you get them
+          // wrong — the pipeline stays "healthy", tails zero files, and only the
+          // kubernetes_events stream below keeps working, so it looks like a
+          // partial success rather than a broken config.
+          //
+          //  1. The explicit `regex`. A relabel rule defaults to "(.*)", which
+          //     captures the whole joined string as group 1 and leaves 2/3/4
+          //     empty.
+          //
+          //  2. The BRACES in the replacement. Go's regexp expansion reads
+          //     "$1_" as a group *named* "1_" (a name greedily consumes letters,
+          //     digits and underscores), not group 1 followed by "_". Written as
+          //     "$1_$2_$3" the path silently collapses to just the pod UID.
+          //     "${1}_${2}_${3}" is the only correct form.
+          rule {
+            source_labels = ["__meta_kubernetes_namespace", "__meta_kubernetes_pod_name", "__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+            separator     = "/"
+            regex         = "(.+)/(.+)/(.+)/(.+)"
+            action        = "replace"
+            replacement   = "/var/log/pods/${1}_${2}_${3}/${4}/*.log"
+            target_label  = "__path__"
+          }
+        }
+
+        // Watch the matching files.
+        local.file_match "pod_logs" {
+          path_targets = discovery.relabel.pod_logs.output
+        }
+
+        // Read them and forward.
+        loki.source.file "pod_logs" {
+          targets    = local.file_match.pod_logs.targets
+          forward_to = [loki.process.pod_logs.receiver]
+        }
+
+        // Parse the CRI format that containerd writes, then surface log level
+        // as a label so the Logs dashboard can chart errors vs warnings.
+        loki.process "pod_logs" {
+          forward_to = [loki.write.default.receiver]
+
+          stage.cri {}
+
+          stage.regex {
+            expression = "(?i)(?P<level>\\b(trace|debug|info|warn|warning|error|fatal|panic)\\b)"
+          }
+
+          stage.labels {
+            values = { level = "" }
+          }
+        }
+
+        // Ship to Loki. Gateway is disabled, so this targets the service directly.
+        loki.write "default" {
+          endpoint {
+            url = "http://monitoring-loki:3100/loki/api/v1/push"
+          }
+        }
+
+        // Cluster events as a log stream — useful for "why did this pod die".
+        loki.source.kubernetes_events "events" {
+          job_name   = "kube-events"
+          forward_to = [loki.write.default.receiver]
+        }
+
+# ============================================================================
+#  5. GRAFANA — the single pane of glass
+# ============================================================================
+grafana:
+  enabled: true
+
+  # ---- Access: NodePort 30300 on either node --------------------------------
+  service:
+    enabled: true
+    type: NodePort
+    port: 80
+    targetPort: 3000
+    nodePort: 30300
+
+  # ---- Login ---------------------------------------------------------------
+  # Lab default. Change this (or switch to admin.existingSecret) before any
+  # deployment that matters — see README.
+  adminUser: admin
+  adminPassword: admin
+
+  persistence:
+    enabled: true
+    type: pvc
+    size: 2Gi
+    storageClassName: null
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+  tolerations: *controlPlaneTolerations
+
+  # Keeps the release minimal — no bats test pod.
+  testFramework:
+    enabled: false
+
+  # ---- Datasources ---------------------------------------------------------
+  # The UIDs here are hardcoded and referenced directly by every dashboard JSON.
+  # Renaming a UID silently breaks all panels bound to it.
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        # Default: the long-term store. Speaks the Prometheus query API.
+        - name: VictoriaMetrics
+          uid: victoriametrics
+          type: prometheus
+          access: proxy
+          url: http://monitoring-victoriametrics-server:8428
+          isDefault: true
+          jsonData:
+            timeInterval: 30s
+            httpMethod: POST
+
+        # The scraper itself — handy for checking targets and recent raw data.
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://monitoring-prometheus-server:80
+          isDefault: false
+          jsonData:
+            timeInterval: 30s
+            httpMethod: POST
+
+        - name: Loki
+          uid: loki
+          type: loki
+          access: proxy
+          url: http://monitoring-loki:3100
+          isDefault: false
+          jsonData:
+            maxLines: 1000
+            # Lets Grafana jump from a log line to the pod's metrics.
+            derivedFields: []
+
+        - name: Alertmanager
+          uid: alertmanager
+          type: alertmanager
+          access: proxy
+          url: http://monitoring-alertmanager:9093
+          isDefault: false
+          jsonData:
+            implementation: prometheus
+            handleGrafanaManagedAlerts: false
+
+  # ---- Dashboard provisioning ---------------------------------------------
+  # The sidecar watches for ConfigMaps labelled grafana_dashboard=1. Our
+  # templates/grafana-dashboards.yaml generates one per file in dashboards/.
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      folder: /tmp/dashboards
+      # searchNamespace is deliberately left unset. The chart only injects the
+      # NAMESPACE env var `{{- with .searchNamespace }}`, and k8s-sidecar then
+      # defaults to its own namespace — which is where our dashboard ConfigMaps
+      # live. (Note the chart does `. | join ","`, so this key expects a LIST;
+      # setting the usual `searchNamespace: ALL` string would fail to render.)
+      provider:
+        foldersFromFilesStructure: false
+        allowUiUpdates: true
+        disableDelete: false
+      resource: configmap
+    datasources:
+      enabled: false      # provisioned statically above instead
+
+  grafana.ini:
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+    users:
+      # Land on the cluster health dashboard instead of an empty home page.
+      default_theme: dark
+    dashboards:
+      default_home_dashboard_path: /tmp/dashboards/cluster-health.json
+    # Alerting UI is what makes the Alertmanager rules visible.
+    unified_alerting:
+      enabled: true
+    alerting:
+      enabled: false

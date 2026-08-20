@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kubectl config get-contexts *)",
+      "Bash(kubectl version *)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl describe *)",
+      "Bash(helm repo *)",
+      "Bash(helm version *)",
+      "Bash(timeout 15 curl -sI https://prometheus-community.github.io/helm-charts/index.yaml)",
+      "Bash(helm dependency *)"
+    ]
+  }
+}
