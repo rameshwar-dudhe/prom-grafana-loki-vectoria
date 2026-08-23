@@ -61,11 +61,21 @@ template:
 # validation to resolve namespaced objects, so we ensure it first.
 dryrun:
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	@# --server-side is required, not cosmetic. The CRD upgrade job ships the
+	@# CRDs as a ~800KB ConfigMap, and a client-side apply stores the manifest
+	@# in a last-applied-configuration annotation that blows past the 262144
+	@# byte limit. Server-side apply keeps no such annotation.
+	@# No -n here on purpose: kube-prometheus-stack puts the kubelet and coredns
+	@# ServiceMonitors in kube-system, and a namespace flag would conflict with
+	@# the namespace those objects already declare.
 	helm template $(RELEASE) ./$(CHART) --namespace $(NAMESPACE) \
-	  | kubectl apply --dry-run=server -n $(NAMESPACE) -f - >/dev/null && \
+	  | kubectl apply --dry-run=server --server-side --force-conflicts \
+	    -f - >/dev/null && \
 	  echo "server-side dry run OK"
-	@echo -n "CRDs this chart would create (must be 0): "
-	@helm template $(RELEASE) ./$(CHART) --namespace $(NAMESPACE) \
+	@# The chart used to guarantee zero CRDs. It now ships the Prometheus
+	@# Operator, so the guarantee moved: `make uninstall` deletes them by name.
+	@echo -n "CRDs this chart installs (expected 10): "
+	@helm template $(RELEASE) ./$(CHART) --namespace $(NAMESPACE) --include-crds \
 	  | grep -c "^kind: CustomResourceDefinition" || true
 
 install:
@@ -115,6 +125,17 @@ password:
 uninstall:
 	-helm uninstall $(RELEASE) -n $(NAMESPACE)
 	-kubectl delete ns $(NAMESPACE) --wait=true
+	@# Helm never deletes CRDs, so the operator's are removed by name here.
+	@# This is what keeps "remove cleanly in one command" true now that the
+	@# chart is no longer CRD-free.
+	@#
+	@# WARNING: deleting a CRD deletes every object of that kind CLUSTER-WIDE.
+	@# If anything outside this chart has created ServiceMonitors or
+	@# PrometheusRules, they go too. On a shared cluster, drop this step and
+	@# remove the CRDs by hand once you are sure nothing else uses them.
+	-kubectl get crd -o name 2>/dev/null \
+	  | grep "monitoring\.coreos\.com" \
+	  | xargs -r kubectl delete --wait=true
 	@echo ""
 	@echo "removed. verifying nothing was left behind:"
 	@# Matched by ownership label, NOT by name. Kubernetes ships built-in
@@ -130,7 +151,8 @@ uninstall:
 	  print(sum(1 for p in json.load(sys.stdin)['items'] \
 	  if (p['spec'].get('claimRef') or {}).get('namespace')=='$(NAMESPACE)'))"
 	@echo -n "  CRDs added by this chart:                     "
-	@kubectl get crd -o name 2>/dev/null | grep -cE "monitoring\.grafana\.com|victoriametrics" || true
+	@kubectl get crd -o name 2>/dev/null \
+	  | grep -cE "monitoring\.coreos\.com|monitoring\.grafana\.com|victoriametrics" || true
 	@echo ""
 	@echo "  all three should be 0."
 

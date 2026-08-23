@@ -55,10 +55,18 @@ keeps only 6 hours locally. Everything is streamed to VictoriaMetrics, which is
 the long-term store (15 days) and Grafana's **default** datasource. You get VM's
 storage efficiency without hand-writing scrape discovery.
 
-**Why not kube-prometheus-stack?** It installs CRDs, and `helm uninstall` never
-removes CRDs. Since "easy to remove" was a requirement, every component here is
-deliberately CRD-free. The chart renders **zero** CustomResourceDefinitions, and
-`make test` asserts that.
+**Why kube-prometheus-stack?** The scraper is the Prometheus Operator, so scrape
+targets are declared as ServiceMonitor objects rather than hand-written YAML.
+This chart originally avoided it precisely because it installs CRDs and
+`helm uninstall` never removes them — "easy to remove" was a requirement. That
+requirement has not been dropped, it is met differently: `make uninstall`
+deletes the 10 `monitoring.coreos.com` CRDs by name, and `make test` asserts
+that exactly those 10 are present and nothing else has leaked.
+
+**Annotation-based discovery still works.** ServiceMonitors cover everything
+this chart owns, but a `kubernetes-pods` scrape job is kept alongside them so
+any workload carrying plain `prometheus.io/scrape` annotations is still picked
+up without writing a ServiceMonitor for it.
 
 ---
 
@@ -69,10 +77,10 @@ deliberately CRD-free. The chart renders **zero** CustomResourceDefinitions, and
 | `make deps` | Adds the three helm repos and runs `helm dependency build` |
 | `make lint` | `helm lint` |
 | `make template` | Render all manifests to stdout |
-| `make dryrun` | Render **and** validate against the live API server; also counts CRDs |
+| `make dryrun` | Render **and** validate against the live API server; also counts CRDs (expects 10) |
 | `make install` | Install and wait for readiness |
 | `make upgrade` | Apply `values.yaml` changes to a running release |
-| `make test` | 35 end-to-end assertions (see below) |
+| `make test` | 36 end-to-end assertions (see below) |
 | `make status` | Pods, PVCs and DaemonSet coverage |
 | `make url` / `make password` | Grafana URL / admin password |
 | `make uninstall` | Remove the release **and** the namespace |
@@ -95,7 +103,7 @@ checks, among other things:
 - **each dashboard's key query replayed through Grafana's datasource proxy
   returns non-empty data** — this is the check that catches a green-but-empty stack
 - Grafana answers on the NodePort from both node IPs
-- zero CRDs were installed
+- the operator's 10 CRDs are present and no unmanaged CRD has leaked
 
 ---
 
@@ -116,7 +124,13 @@ up — the namespace delete is the simple way to cover both cases without you
 having to remember which is which.)
 
 Verified clean: after uninstall there are **0** cluster-scoped objects owned by
-the release, **0** orphaned PVs from the namespace, and **0** CRDs.
+the release, **0** orphaned PVs from the namespace, and **0** CRDs — the
+operator's CRDs are deleted by name, since Helm will not do it.
+
+**On a shared cluster, read that step first.** Deleting a CRD deletes every
+object of that kind cluster-wide, so any ServiceMonitor or PrometheusRule
+created outside this chart goes with it. The `uninstall` target in the Makefile
+carries the same warning.
 
 ---
 
@@ -205,10 +219,10 @@ file count should be non-zero:
 
 ```
 Makefile                        deploy / verify / remove
-scripts/verify.sh               the 35 end-to-end assertions
+scripts/verify.sh               the 36 end-to-end assertions
 ADDING-A-DASHBOARD.md           how to add a dashboard of your own
 monitoring-stack/
-├── Chart.yaml                  umbrella + 5 pinned CRD-free dependencies
+├── Chart.yaml                  umbrella + 5 pinned dependencies
 ├── values.yaml                 all configuration, per component
 ├── templates/
 │   ├── _helpers.tpl            labels + the release-name guard
@@ -231,7 +245,7 @@ the Helm pipeline validates dashboard JSON, so check it yourself before deployin
 
 | Chart | Version | App |
 |---|---|---|
-| prometheus | 29.24.0 | v3.13.2 |
+| kube-prometheus-stack | 88.5.3 | operator v0.93.1 / prom v3.14.0 |
 | victoria-metrics-single | 0.44.0 | v1.149.0 |
 | loki | 7.3.0 | 3.6.12 |
 | alloy | 1.11.1 | v1.18.1 |

@@ -20,16 +20,19 @@ maintainers:
   - name: Platform
     email: vikrant.satpute@consectus.com
 
-# NOTE: every dependency below is CRD-free on purpose.
-# kube-prometheus-stack and victoria-metrics-operator would be the more common
-# picks, but Helm never deletes CRDs on uninstall, which would break the
-# "remove cleanly in one command" requirement.
+# NOTE: this chart installs the Prometheus Operator, which brings 10 CRDs
+# (monitoring.coreos.com). Helm never deletes CRDs on uninstall, so the
+# "remove cleanly in one command" guarantee is preserved by `make uninstall`
+# deleting them explicitly rather than by avoiding them. Every other
+# dependency below is still CRD-free.
 dependencies:
-  # Scraper + kube-state-metrics + node-exporter + Alertmanager (all subcharts).
-  - name: prometheus
-    version: "29.24.0"
+  # Prometheus Operator + Prometheus + Alertmanager + kube-state-metrics +
+  # node-exporter (all subcharts). Its bundled Grafana is disabled in
+  # values.yaml; the grafana dependency below is the one that runs.
+  - name: kube-prometheus-stack
+    version: "88.5.3"
     repository: https://prometheus-community.github.io/helm-charts
-    condition: prometheus.enabled
+    condition: kube-prometheus-stack.enabled
 
   # Long-term metric store; Grafana's default datasource.
   - name: victoria-metrics-single

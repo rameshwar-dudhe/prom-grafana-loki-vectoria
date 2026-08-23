@@ -116,7 +116,7 @@ done < <(kubectl get ds -n "$NS" --no-headers 2>/dev/null | awk '{print $1, $2, 
 
 section "4. Prometheus — scraping"
 
-targets=$(kexec "curl -s 'http://${RELEASE}-prometheus-server/api/v1/targets?state=active'")
+targets=$(kexec "curl -s 'http://${RELEASE}-kube-prometheus-prometheus:9090/api/v1/targets?state=active'")
 if [[ -z "$targets" ]]; then
   bad "could not reach Prometheus API"
 else
@@ -333,11 +333,25 @@ fi
 
 section "10. Clean-uninstall guarantee"
 
-crds=$(kubectl get crd -o name 2>/dev/null | grep -cE "monitoring\.grafana\.com|monitoring\.coreos\.com|victoriametrics" || true)
-if [[ "$crds" -eq 0 ]]; then
-  ok "no monitoring CRDs installed (uninstall will leave nothing behind)"
+# The Prometheus Operator brings CRDs and Helm never deletes them, so this is
+# no longer a "zero CRDs" check. What still has to hold is that every CRD
+# present is one `make uninstall` knows to remove: the monitoring.coreos.com
+# set. A grafana.com or victoriametrics CRD would be an operator nobody asked
+# for, and would genuinely leak on uninstall.
+operator_crds=$(kubectl get crd -o name 2>/dev/null | grep -c "monitoring\.coreos\.com" || true)
+stray_crds=$(kubectl get crd -o name 2>/dev/null | grep -cE "monitoring\.grafana\.com|victoriametrics" || true)
+
+if [[ "$operator_crds" -eq 10 ]]; then
+  ok "10 Prometheus Operator CRDs present, all removed by 'make uninstall'"
 else
-  bad "$crds monitoring CRD(s) present" "Helm will not remove these on uninstall"
+  bad "expected 10 monitoring.coreos.com CRDs, found $operator_crds" \
+      "the operator's CRD set is incomplete; ServiceMonitors may not work"
+fi
+
+if [[ "$stray_crds" -eq 0 ]]; then
+  ok "no unmanaged CRDs (nothing will leak on uninstall)"
+else
+  bad "$stray_crds unmanaged CRD(s) present" "make uninstall does not remove these"
 fi
 
 # ---------------------------------------------------------------------------

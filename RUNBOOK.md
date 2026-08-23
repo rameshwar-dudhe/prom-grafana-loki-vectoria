@@ -65,7 +65,7 @@ re-check each one.
 | `local-path-provisioner` has no control-plane toleration | PVC provisioning needs at least one schedulable worker |
 | scheduler + controller-manager bind `--bind-address=127.0.0.1` | No scrape jobs for them — avoids permanently-red targets |
 | kubelet + cAdvisor reachable | Node and pod metrics work with no extra setup |
-| Helm never deletes CRDs on uninstall | Every dependency is CRD-free, and Alloy's CRD subchart is force-disabled |
+| Helm never deletes CRDs on uninstall | `make uninstall` deletes the operator's 10 CRDs by name; Alloy's CRD subchart stays force-disabled |
 | 8 CPU / 7.4 GiB per node | Loki's default 8 GiB memcached had to be disabled |
 
 ---
@@ -77,9 +77,9 @@ re-check each one.
 ├── RUNBOOK.md                          this file
 ├── README.md                           user-facing overview
 ├── Makefile                            deps / install / test / uninstall
-├── scripts/verify.sh                   35 end-to-end assertions
+├── scripts/verify.sh                   36 end-to-end assertions
 └── monitoring-stack/
-    ├── Chart.yaml                      umbrella + 5 pinned CRD-free deps
+    ├── Chart.yaml                      umbrella + 5 pinned deps
     ├── Chart.lock                       resolved dependency versions
     ├── values.yaml                     ALL configuration (702 lines, commented)
     ├── charts/*.tgz                    vendored subcharts (from `make deps`)
@@ -98,7 +98,7 @@ re-check each one.
 
 | Chart | Repo | Chart version | App version |
 |---|---|---|---|
-| `prometheus` | prometheus-community | 29.24.0 | v3.13.2 |
+| `kube-prometheus-stack` | prometheus-community | 88.5.3 | operator v0.93.1 / prom v3.14.0 |
 | `victoria-metrics-single` (alias `victoriametrics`) | vm | 0.44.0 | v1.149.0 |
 | `loki` | grafana | 7.3.0 | 3.6.12 |
 | `alloy` | grafana | 1.11.1 | v1.18.1 |
@@ -146,7 +146,7 @@ make dryrun    # render AND validate against the live API + count CRDs
 
 ```
 server-side dry run OK
-CRDs this chart would create (must be 0): 0
+CRDs this chart installs (expected 10): 10
 ```
 
 ---
@@ -180,7 +180,7 @@ monitoring-kube-state-metrics-<id>               1/1  Running
 monitoring-loki-0                                2/2  Running
 monitoring-prometheus-node-exporter-<id>         1/1  Running   (k8s-w-0)
 monitoring-prometheus-node-exporter-<id>         1/1  Running   (k8s-cp-0)
-monitoring-prometheus-server-<id>                2/2  Running
+prometheus-monitoring-kube-prometheus-prometheus-0   2/2  Running
 monitoring-victoriametrics-server-0              1/1  Running
 ```
 
@@ -189,7 +189,7 @@ monitoring-victoriametrics-server-0              1/1  Running
 | PVC | Size |
 |---|---|
 | `monitoring-grafana` | 2Gi |
-| `monitoring-prometheus-server` | 5Gi |
+| `prometheus-monitoring-kube-prometheus-prometheus-db-...-0` | 5Gi |
 | `server-volume-monitoring-victoriametrics-server-0` | 10Gi |
 | `storage-monitoring-loki-0` | 10Gi |
 
@@ -246,9 +246,9 @@ kubectl port-forward -n monitoring svc/monitoring-grafana 3000:80
 | Name | UID | URL |
 |---|---|---|
 | VictoriaMetrics *(default)* | `victoriametrics` | `http://monitoring-victoriametrics-server:8428` |
-| Prometheus | `prometheus` | `http://monitoring-prometheus-server:80` |
+| Prometheus | `prometheus` | `http://monitoring-kube-prometheus-prometheus:9090` |
 | Loki | `loki` | `http://monitoring-loki:3100` |
-| Alertmanager | `alertmanager` | `http://monitoring-alertmanager:9093` |
+| Alertmanager | `alertmanager` | `http://monitoring-kube-prometheus-alertmanager:9093` |
 
 Renaming any UID breaks every panel bound to it.
 
@@ -269,7 +269,7 @@ under `prometheus.alertmanager.config` in `values.yaml` if you want that.
 make test
 ```
 
-35 assertions. This is not a smoke test — it proves data is *flowing*, because a
+36 assertions. This is not a smoke test — it proves data is *flowing*, because a
 stack where every pod is `Running` and every dashboard is empty looks perfectly
 healthy to `kubectl`.
 
@@ -286,12 +286,12 @@ What it checks:
 | 7. Grafana | healthy, 4 datasources, 4 dashboards provisioned |
 | 8. Panel data | **each dashboard's key query replayed through Grafana's datasource proxy returns non-empty data** ← catches a green-but-empty stack |
 | 9. External access | NodePort answers HTTP 200 from both node IPs |
-| 10. Clean uninstall | zero CRDs installed |
+| 10. Clean uninstall | exactly the operator's 10 CRDs present, no unmanaged CRD leaked |
 
 Expected output ends with:
 
 ```
-  35 passed, 0 failed
+  36 passed, 0 failed
 
   Everything is flowing. Open Grafana:
     http://192.168.56.134:30300  (admin / admin)
@@ -321,11 +321,11 @@ kubectl exec -n monitoring q -- curl -s \
 
 # scrape target health
 kubectl exec -n monitoring q -- curl -s \
-  'http://monitoring-prometheus-server/api/v1/targets?state=active'
+  'http://monitoring-kube-prometheus-prometheus:9090/api/v1/targets?state=active'
 
 # alert rules loaded?
 kubectl exec -n monitoring q -- curl -s \
-  'http://monitoring-prometheus-server/api/v1/rules'
+  'http://monitoring-kube-prometheus-prometheus:9090/api/v1/rules'
 
 kubectl delete pod q -n monitoring --wait=false
 ```
@@ -392,7 +392,7 @@ rm -rf /root/prom-grafana-loki-vectoria      # everything, including this runboo
 make deps && make install && make test
 ```
 
-Measured: fresh install completes in **58 seconds**, then 35/35 once data flows.
+Measured: fresh install completes in **58 seconds**, then 36/36 once data flows.
 
 ---
 
@@ -443,8 +443,8 @@ wrong or absent. Three cost real debugging time during the build.
 
 `alloy/values.yaml` has `crds.create: true` and ships a `crds` subchart for the
 `monitoring.grafana.com` `PodLogs` CRD. Helm **never** deletes CRDs on uninstall,
-so this quietly defeats the clean-removal requirement that drove the entire
-CRD-free chart selection.
+so this quietly defeats the clean-removal requirement. `make uninstall` only
+removes `monitoring.coreos.com` CRDs, so Alloy's would be left behind.
 
 ```yaml
 alloy:
@@ -452,7 +452,10 @@ alloy:
     create: false      # never turn this on
 ```
 
-`make dryrun` and `make test` both assert zero CRDs so it cannot regress.
+`make test` asserts that no `monitoring.grafana.com` CRD exists, so it cannot
+regress. Note the reasoning shifted once the chart adopted the Prometheus
+Operator: CRDs are no longer forbidden outright, but every CRD present must be
+one `make uninstall` knows to delete. Alloy's is not, so it stays off.
 
 ### Trap 2 — Loki's defaults cannot fit this cluster
 
@@ -688,7 +691,7 @@ make upgrade             # apply values.yaml changes
 make reinstall           # uninstall then install fresh
 
 # inspect
-make test                # 35 end-to-end assertions
+make test                # 36 end-to-end assertions
 make status              # pods + PVCs + DaemonSets
 make pods                # watch pods
 make url                 # Grafana URL + password
@@ -740,7 +743,7 @@ kubectl delete ns monitoring
 | Found + fixed Alloy `__path__` (trap 3) | 34 files tailed on cp-0, 25 on w-0 |
 | Alertmanager datasource → existence-only check | expected `plugin.unavailable` |
 | Log-node check → bounded retry | removed a startup-race false failure |
-| Full `make test` | **35 passed, 0 failed** |
+| Full `make test` | **36 passed, 0 failed** |
 | Uninstall test | 0 release-owned cluster objects, 0 orphaned PVs, 0 CRDs |
-| Fresh reinstall | 58 seconds, then 35/35 |
+| Fresh reinstall | 58 seconds, then 36/36 |
 | Final teardown | namespace deleted, cluster clean |

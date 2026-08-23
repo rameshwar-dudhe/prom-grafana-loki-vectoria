@@ -10,6 +10,23 @@ A single, start-to-finish procedure for the `monitoring-stack` chart, with the
 
 Everything below was executed in order. Nothing is aspirational.
 
+> **⚠️ This run predates the Prometheus Operator migration.** It captures the
+> stack as it was on 2026-08-15, when scraping came from the plain `prometheus`
+> chart. The command sequence — `make lint`, `dryrun`, `install`, `test`,
+> `uninstall` — is unchanged and still correct, but the output below differs
+> from what you will see today in three ways:
+>
+> | Then | Now |
+> |---|---|
+> | `CRDs this chart would create (must be 0): 0` | `CRDs this chart installs (expected 10): 10` |
+> | `35 passed, 0 failed` | `36 passed, 0 failed` |
+> | pod `monitoring-prometheus-server-<id>` | pods `prometheus-monitoring-kube-prometheus-prometheus-0`, `monitoring-kube-prometheus-operator-<id>`, `alertmanager-monitoring-kube-prometheus-alertmanager-0` |
+>
+> `make uninstall` now also deletes the 10 `monitoring.coreos.com` CRDs by name.
+> See README.md for the reasoning. This file will be re-captured on the next
+> full teardown; it is left as-is rather than hand-edited, because its whole
+> value is being a real transcript.
+
 ---
 
 ## 0. Preconditions

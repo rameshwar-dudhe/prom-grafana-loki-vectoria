@@ -44,161 +44,241 @@ _tolerateEverything: &tolerateEverything
 # ============================================================================
 #  1. PROMETHEUS — scraper + kube-state-metrics + node-exporter + Alertmanager
 # ============================================================================
-prometheus:
+kube-prometheus-stack:
   enabled: true
 
-  server:
-    # Short local retention on purpose: Prometheus is the *scraper* here, while
-    # VictoriaMetrics is the long-term store. Keeping 6h locally is enough to
-    # ride out a VM restart without wasting disk on duplicate storage.
-    retention: 6h
+  # This chart bundles its own Grafana. We do not use it — section 5 below runs
+  # the grafana chart directly so the datasources and the dashboards/ folder stay
+  # under our control. Two Grafanas would also fight over NodePort 30300.
+  grafana:
+    enabled: false
 
-    persistentVolume:
-      enabled: true
-      size: 5Gi
-      # local-path is the cluster default; left blank to use it.
-      storageClass: ""
-
-    # ---- remote_write to VictoriaMetrics -----------------------------------
-    # Service name comes from the `victoriametrics` alias in Chart.yaml.
-    remoteWrite:
-      - url: http://monitoring-victoriametrics-server:8428/api/v1/write
-        remote_timeout: 30s
-        queue_config:
-          capacity: 5000
-          max_shards: 5
-          min_shards: 1
-          max_samples_per_send: 1000
-          batch_send_deadline: 5s
-
-    resources:
-      requests:
-        cpu: 500m
-        memory: 1Gi
-      limits:
-        memory: 2Gi
-
-    tolerations: *controlPlaneTolerations
-
-    service:
-      type: ClusterIP
-
-    global:
-      scrape_interval: 30s
-      scrape_timeout: 10s
-      evaluation_interval: 30s
-      external_labels:
-        cluster: k8s-ha
-
-  # ---- Alertmanager --------------------------------------------------------
-  # Enabled, but with no notification receivers: alerts are for *viewing* in
-  # Grafana, not paging. Add a receiver here when you want notifications.
-  alertmanager:
+  # The operator's CRDs. Installing these is the trade this chart now makes:
+  # see the note in Chart.yaml. `make uninstall` removes them explicitly,
+  # because Helm never will.
+  #
+  # upgradeJob applies the CRDs from a pre-install/pre-upgrade hook, which is
+  # how CRD *schema* changes land when this chart's version is bumped — Helm
+  # itself only ever installs crds/ on first install and silently skips them on
+  # upgrade. Upstream marks the job preview.
+  #
+  # It does NOT rescue the first migration onto an already-existing release.
+  # Helm resolves every manifest against the API server before it runs any
+  # hook, so with no CRDs yet present it fails at "no matches for kind
+  # ServiceMonitor" and the hook never gets a chance to run. That one-time case
+  # needs the CRDs applied by hand first:
+  #
+  #   tar xzf monitoring-stack/charts/kube-prometheus-stack-88.5.3.tgz \
+  #     kube-prometheus-stack/charts/crds/crds/
+  #   kubectl apply --server-side --force-conflicts \
+  #     -f kube-prometheus-stack/charts/crds/crds/
+  #
+  # (--server-side because crd-prometheuses.yaml alone is 816KB, over the
+  # annotation limit a client-side apply would need.)
+  crds:
     enabled: true
-    persistence:
-      enabled: false          # alert state is disposable; avoids a 5th PVC
+    upgradeJob:
+      enabled: true
+      forceConflicts: true
+
+  prometheusOperator:
+    tolerations: *controlPlaneTolerations
     resources:
       requests:
         cpu: 50m
-        memory: 64Mi
-      limits:
         memory: 128Mi
-    tolerations: *controlPlaneTolerations
+      limits:
+        memory: 256Mi
 
-  # ---- kube-state-metrics: cluster object state (pods, deployments, nodes) --
-  kube-state-metrics:
+  # ------------------------------------------------------------------------
+  #  Prometheus itself — still the scraper, not the store. Short local
+  #  retention; everything is remote_written to VictoriaMetrics.
+  # ------------------------------------------------------------------------
+  prometheus:
+    prometheusSpec:
+      retention: 6h
+      scrapeInterval: 30s
+      evaluationInterval: 30s
+
+      # By default the operator only picks up ServiceMonitors carrying this
+      # release's label, which would silently ignore anything created outside
+      # the chart — including the VictoriaMetrics one enabled in section 2.
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      scrapeConfigSelectorNilUsesHelmValues: false
+
+      remoteWrite:
+        - url: http://monitoring-victoriametrics-server:8428/api/v1/write
+          remoteTimeout: 30s
+
+      # ------------------------------------------------------------------
+      #  Annotation-based discovery, carried over from the plain prometheus
+      #  chart. The operator model is ServiceMonitors, but any workload that
+      #  only carries prometheus.io/scrape annotations — Keycloak, for one —
+      #  would become invisible without this job. Everything this chart owns
+      #  is discovered through ServiceMonitors instead, so there is no
+      #  double-scraping.
+      # ------------------------------------------------------------------
+      additionalScrapeConfigs:
+        - job_name: kubernetes-pods
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: true
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+              action: replace
+              regex: (https?)
+              target_label: __scheme__
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              action: replace
+              target_label: __metrics_path__
+              regex: (.+)
+            - source_labels:
+                - __address__
+                - __meta_kubernetes_pod_annotation_prometheus_io_port
+              action: replace
+              regex: (.+?)(?::\d+)?;(\d+)
+              replacement: $1:$2
+              target_label: __address__
+            - action: labelmap
+              regex: __meta_kubernetes_pod_label_(.+)
+            - source_labels: [__meta_kubernetes_namespace]
+              action: replace
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              action: replace
+              target_label: pod
+            # Same `node` label the ServiceMonitors below produce, so a pod
+            # scraped this way can still be grouped per node.
+            - source_labels: [__meta_kubernetes_pod_node_name]
+              action: replace
+              target_label: node
+            - source_labels: [__meta_kubernetes_pod_phase]
+              regex: Pending|Succeeded|Failed|Completed
+              action: drop
+
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 5Gi
+
+      tolerations: *controlPlaneTolerations
+      resources:
+        requests:
+          cpu: 200m
+          memory: 512Mi
+        limits:
+          memory: 1500Mi
+
+  # ------------------------------------------------------------------------
+  #  Alertmanager. Alert state is disposable, so no PVC — same call the plain
+  #  chart made.
+  # ------------------------------------------------------------------------
+  alertmanager:
+    alertmanagerSpec:
+      tolerations: *controlPlaneTolerations
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 128Mi
+
+  # ------------------------------------------------------------------------
+  #  kubelet + cAdvisor.
+  #
+  #  IMPORTANT: nothing in kube-prometheus-stack emits a `node` label —
+  #  `grep -rn "targetLabel: node"` over the chart returns nothing. 37 queries
+  #  across dashboards/ group by it, so it has to be added here.
+  #
+  #  Helm REPLACES lists rather than merging them, so the chart's original
+  #  metrics_path entry is restated below; dropping it breaks the upstream
+  #  kubelet alert rules that match on it.
+  # ------------------------------------------------------------------------
+  kubelet:
     enabled: true
+    serviceMonitor:
+      relabelings:
+        # --- original chart entry ---
+        - action: replace
+          sourceLabels: [__metrics_path__]
+          targetLabel: metrics_path
+        # --- our addition ---
+        - action: replace
+          sourceLabels: [__meta_kubernetes_endpoint_address_target_name]
+          targetLabel: node
+      cAdvisorRelabelings:
+        # --- original chart entry ---
+        - action: replace
+          sourceLabels: [__metrics_path__]
+          targetLabel: metrics_path
+        # --- our addition ---
+        - action: replace
+          sourceLabels: [__meta_kubernetes_endpoint_address_target_name]
+          targetLabel: node
+
+  kube-state-metrics:
+    tolerations: *controlPlaneTolerations
     resources:
       requests:
         cpu: 50m
         memory: 64Mi
       limits:
         memory: 192Mi
-    tolerations: *controlPlaneTolerations
 
-  # ---- node-exporter: per-node CPU / memory / disk / network ---------------
-  # DaemonSet: must tolerate EVERYTHING or k8s-cp-0 silently goes missing from
-  # every node dashboard.
+  # ------------------------------------------------------------------------
+  #  node-exporter. `operator: Exists` is what puts it on the tainted
+  #  control-plane node — that is the 2/2 DaemonSet `make test` asserts on.
+  #  Its ServiceMonitor needs the same `node` label treatment as the kubelet.
+  # ------------------------------------------------------------------------
   prometheus-node-exporter:
-    enabled: true
+    tolerations:
+      - operator: Exists
     resources:
       requests:
         cpu: 50m
-        memory: 64Mi
+        memory: 32Mi
       limits:
-        memory: 128Mi
-    tolerations: *tolerateEverything
+        memory: 64Mi
+    prometheus:
+      monitor:
+        relabelings:
+          - action: replace
+            sourceLabels: [__meta_kubernetes_pod_node_name]
+            targetLabel: node
 
-  # ---- pushgateway: not used, and it would show up as a down target --------
-  prometheus-pushgateway:
+  # Components the k8s-ha cluster does not expose to scrape. Leaving them on
+  # would produce permanently-down targets and noisy alerts.
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeProxy:
+    enabled: false
+  kubeEtcd:
     enabled: false
 
   # ------------------------------------------------------------------------
-  #  Scrape configuration
+  #  Alert rules. The operator reads PrometheusRule objects, so the groups
+  #  that used to live under serverFiles."alerting_rules.yml" move here
+  #  unchanged. No receivers are configured — view them in Grafana > Alerting.
   #
-  #  The prometheus chart exposes each job as a key under `scrapeConfigs`.
-  #  IMPORTANT: Helm REPLACES lists, it does not merge them. So where we touch
-  #  `relabel_configs` below we restate the chart's original entries and then
-  #  add ours — dropping the originals would break target discovery.
+  #  defaultRules stays off: kube-prometheus-stack ships ~100 rules aimed at a
+  #  full production cluster, and most of them fire immediately on a two-node
+  #  lab (etcd, scheduler and controller-manager are not scraped at all).
   # ------------------------------------------------------------------------
-  scrapeConfigs:
+  defaultRules:
+    create: false
 
-    # kubelet's own metrics. The chart's default relabeling produces no `node`
-    # label, so per-node grouping is impossible without this addition.
-    kubernetes-nodes:
-      enabled: true
-      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-      scheme: https
-      tls_config:
-        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        insecure_skip_verify: true
-      kubernetes_sd_configs:
-        - role: node
-      relabel_configs:
-        # --- original chart entry ---
-        - action: labelmap
-          regex: __meta_kubernetes_node_label_(.+)
-        # --- our addition: give every series a stable `node` label ---
-        - source_labels: [__meta_kubernetes_node_name]
-          target_label: node
-
-    # cAdvisor: per-container CPU / memory / network. Same missing-`node` issue,
-    # and this is the job the pod dashboards depend on most.
-    kubernetes-nodes-cadvisor:
-      enabled: true
-      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-      scheme: https
-      metrics_path: /metrics/cadvisor
-      tls_config:
-        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-        insecure_skip_verify: true
-      kubernetes_sd_configs:
-        - role: node
-      relabel_configs:
-        # --- original chart entries ---
-        - action: labelmap
-          regex: __meta_kubernetes_node_label_(.+)
-        - source_labels: [__metrics_path__]
-          target_label: metrics_path
-        # --- our addition ---
-        - source_labels: [__meta_kubernetes_node_name]
-          target_label: node
-
-    # Left at chart defaults — `kubernetes-service-endpoints` already ends with
-    # `__meta_kubernetes_pod_node_name -> node`, so node-exporter and
-    # kube-state-metrics get their `node` label for free.
-    #
-    # Disabled below: the pushgateway job would be a permanently-down target.
-    prometheus-pushgateway:
-      enabled: false
-
-  # ------------------------------------------------------------------------
-  #  Alert rules. `serverFiles."prometheus.yml".rule_files` already points at
-  #  /etc/config/alerting_rules.yml, so these are picked up automatically.
-  #  No receivers are configured — view them in Grafana > Alerting.
-  # ------------------------------------------------------------------------
-  serverFiles:
-    alerting_rules.yml:
+  additionalPrometheusRulesMap:
+    monitoring-stack:
       groups:
         - name: nodes
           rules:
@@ -289,6 +369,7 @@ prometheus:
                 summary: "remote_write to VictoriaMetrics is failing"
                 description: "Metrics are not reaching long-term storage; dashboards will show gaps."
 
+
 # ============================================================================
 #  2. VICTORIAMETRICS — long-term metric store, Grafana's default datasource
 # ============================================================================
@@ -314,11 +395,12 @@ victoriametrics:
 
     tolerations: *controlPlaneTolerations
 
-    # Scraped by Prometheus via the service-endpoints job so VM monitors itself.
-    service:
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8428"
+    # VM monitors itself. This used to rely on the prometheus.io/scrape
+    # annotation and the service-endpoints job; under the operator it is a
+    # ServiceMonitor instead. Prometheus picks it up because
+    # serviceMonitorSelectorNilUsesHelmValues is false in section 1.
+    serviceMonitor:
+      enabled: true
 
   # --------------------------------------------------------------------------
   #  External write/query endpoint (NodePort 30428).
@@ -345,6 +427,10 @@ victoriametrics:
       kind: Service
       metadata:
         name: '{{ .Release.Name }}-victoriametrics-external'
+        # Explicit: extraObjects are rendered verbatim, so without this the
+        # manifest carries no namespace and any `kubectl apply` without -n
+        # would place it in `default`.
+        namespace: '{{ .Release.Namespace }}'
         labels:
           app.kubernetes.io/name: victoriametrics
           app.kubernetes.io/instance: '{{ .Release.Name }}'
@@ -641,6 +727,19 @@ grafana:
     size: 2Gi
     storageClassName: null
 
+  # Disabled deliberately. The chart's init-chown-data container runs as uid 0
+  # but with `capabilities: drop: [ALL], add: [CHOWN]`, so it has no
+  # DAC_OVERRIDE. Grafana creates /var/lib/grafana/{pdf,png,csv} as mode 0700
+  # owned by 472, and `chown -R` cannot descend into them without that
+  # capability — every pod recreation after the first then fails with
+  # "chown: /var/lib/grafana/pdf: Permission denied" and the rollout deadlocks.
+  # It passes on a fresh volume only because those directories do not exist yet.
+  #
+  # The pod already sets fsGroup: 472, so the kubelet applies group ownership to
+  # the volume on mount and the init container has nothing left to do.
+  initChownData:
+    enabled: false
+
   resources:
     requests:
       cpu: 100m
@@ -677,7 +776,7 @@ grafana:
           uid: prometheus
           type: prometheus
           access: proxy
-          url: http://monitoring-prometheus-server:80
+          url: http://monitoring-kube-prometheus-prometheus:9090
           isDefault: false
           jsonData:
             timeInterval: 30s
@@ -698,7 +797,7 @@ grafana:
           uid: alertmanager
           type: alertmanager
           access: proxy
-          url: http://monitoring-alertmanager:9093
+          url: http://monitoring-kube-prometheus-alertmanager:9093
           isDefault: false
           jsonData:
             implementation: prometheus
