@@ -23,6 +23,7 @@ Then open **http://192.168.56.134:30300** (or `.135`) and log in with
 | **Nodes** | per-node CPU (by mode), memory, disk fill, disk I/O, network, load average vs core count, uptime, node inventory |
 | **Pods & Workloads** | per-pod CPU/memory/network, restart counts, top consumers, and a "why isn't this running" table of waiting/terminated reasons |
 | **Logs** | live container logs from every node, filterable by namespace, pod and free text, plus log volume by level and noisiest pods |
+| **Keycloak** | login rate split success vs failed, events by type/realm/error, top source IPs and targeted usernames, request latency, JVM and DB pool — only populated once Keycloak is deployed |
 
 Alerting is included: 9 rules (node not ready, high CPU/memory, disk filling,
 crashlooping, OOMKilled, target down, remote_write failing) visible under
@@ -205,6 +206,7 @@ file count should be non-zero:
 ```
 Makefile                        deploy / verify / remove
 scripts/verify.sh               the 35 end-to-end assertions
+ADDING-A-DASHBOARD.md           how to add a dashboard of your own
 monitoring-stack/
 ├── Chart.yaml                  umbrella + 5 pinned CRD-free dependencies
 ├── values.yaml                 all configuration, per component
@@ -212,7 +214,7 @@ monitoring-stack/
 │   ├── _helpers.tpl            labels + the release-name guard
 │   ├── grafana-dashboards.yaml one ConfigMap per dashboards/*.json
 │   └── NOTES.txt               post-install access instructions
-└── dashboards/                 4 hand-written dashboards (53 panels)
+└── dashboards/                 5 hand-written dashboards (84 panels)
 ```
 
 Dashboards are embedded as JSON rather than fetched by `gnetId`, so provisioning
@@ -220,6 +222,10 @@ needs no internet access at pod runtime and the panels cannot drift from what wa
 tested. They bind to datasources by fixed UID (`victoriametrics`, `prometheus`,
 `loki`, `alertmanager`) — renaming a UID in `values.yaml` breaks every panel
 using it.
+
+To add one of your own, see **[ADDING-A-DASHBOARD.md](ADDING-A-DASHBOARD.md)** —
+drop a `.json` into `dashboards/` and run `make upgrade`. Note that nothing in
+the Helm pipeline validates dashboard JSON, so check it yourself before deploying.
 
 ### Pinned versions
 
