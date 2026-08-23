@@ -320,6 +320,46 @@ victoriametrics:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8428"
 
+  # --------------------------------------------------------------------------
+  #  External write/query endpoint (NodePort 30428).
+  #
+  #  The chart's own `-victoriametrics-server` Service is the StatefulSet's
+  #  governing service, so it MUST stay headless (clusterIP: None) for stable
+  #  pod DNS — and clusterIP is immutable, so it cannot be flipped to NodePort
+  #  in place. Adding a second, additive Service is the clean way to expose VM.
+  #
+  #  Deliberately carries no prometheus.io/scrape annotation: the headless
+  #  service above already advertises it, and a second annotated endpoint
+  #  would give Prometheus a duplicate target for the same pod.
+  #
+  #    remote_write ->  http://<any-node>:30428/api/v1/write
+  #    query        ->  http://<any-node>:30428/api/v1/query
+  #
+  #  SECURITY: VictoriaMetrics single-node has NO authentication. This port
+  #  accepts reads AND writes from anyone who can reach the node, and
+  #  /api/v1/admin/tsdb/delete_series is reachable too. Acceptable on an
+  #  isolated lab network; put it behind an authenticating ingress otherwise.
+  # --------------------------------------------------------------------------
+  extraObjects:
+    - apiVersion: v1
+      kind: Service
+      metadata:
+        name: '{{ .Release.Name }}-victoriametrics-external'
+        labels:
+          app.kubernetes.io/name: victoriametrics
+          app.kubernetes.io/instance: '{{ .Release.Name }}'
+      spec:
+        type: NodePort
+        selector:
+          app: server
+          app.kubernetes.io/name: victoriametrics
+          app.kubernetes.io/instance: '{{ .Release.Name }}'
+        ports:
+          - name: http
+            port: 8428
+            targetPort: http
+            nodePort: 30428
+
 # ============================================================================
 #  3. LOKI — log store, single binary + filesystem
 # ============================================================================
